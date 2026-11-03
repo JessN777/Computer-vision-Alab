@@ -1,8 +1,0 @@
-# Python deps for agent_02_hough_contours (install into the same env that runs rclpy).
-# On Linux ROS2 Humble/Jazzy: also `sudo apt install ros-$ROS_DISTRO-vision-msgs`
-# On Windows RoboStack: `mamba install vision_msgs` when available; JSON fallback otherwise.
-
-opencv-python>=4.8.0
-numpy>=1.23.0
-PyYAML>=6.0
-Pillow>=9.0.0

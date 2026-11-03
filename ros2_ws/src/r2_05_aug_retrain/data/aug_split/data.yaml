@@ -1,5 +1,0 @@
-path: E:/Desktop/Jessica/ros2_ws/src/r2_05_aug_retrain/data/aug_split
-train: images/train
-val: images/val
-names:
-  0: vial

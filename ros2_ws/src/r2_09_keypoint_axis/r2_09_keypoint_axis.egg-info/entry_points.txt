@@ -1,2 +1,0 @@
-[console_scripts]
-vial_detector_node = r2_09_keypoint_axis.vial_detector_node:main

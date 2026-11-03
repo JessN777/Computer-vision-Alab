@@ -1,5 +1,7 @@
 # Orbbec dual sync (ROS 2 workspace)
 
+This simplified branch keeps `orbbec_dual_sync` and `r2_10_fusion_multiorient`. The older `agent_*` and `r2_01`–`r2_09` experiments are on `main` only.
+
 Native **Windows** workflow (RoboStack / Pixi). Full details: [../ROS_SYNC.md](../ROS_SYNC.md).
 
 ## PowerShell (recommended)

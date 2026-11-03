@@ -1,5 +1,0 @@
-numpy>=1.23
-opencv-python>=4.7
-PyYAML>=6.0
-# ROS2 runtime (not pip on most installs):
-#   rclpy, sensor_msgs, std_msgs, vision_msgs (optional), launch, launch_ros

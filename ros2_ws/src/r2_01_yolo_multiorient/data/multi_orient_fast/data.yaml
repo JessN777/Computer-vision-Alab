@@ -1,6 +1,0 @@
-path: E:/Desktop/Jessica/ros2_ws/src/r2_01_yolo_multiorient/data/multi_orient_fast
-train: images/train
-val: images/val
-test: images/test
-names:
-  0: vial
