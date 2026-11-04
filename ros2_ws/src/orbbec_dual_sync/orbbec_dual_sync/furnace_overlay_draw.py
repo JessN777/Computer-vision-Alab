@@ -18,9 +18,6 @@ def default_furnace_json(robotics_root: Path) -> Path:
     return robotics_root / "furnace_state" / "furnace.json"
 
 
-def default_furnace_template(robotics_root: Path) -> Path:
-    return robotics_root / "furnace_state" / "template_furnace.png"
-
 
 def _ensure_robotics(robotics_root: Optional[Path]) -> Path:
     if robotics_root is None:

@@ -49,6 +49,7 @@ class PreviewWindow:
         self.allow_cv2 = bool(allow_cv2)
         self.enabled = True
         self.user_closed = False
+        self.reset_requested = False
         self.last_error = ""
         self.backend: Optional[str] = None  # "cv2" | "tk"
         self._tk_root = None
@@ -136,6 +137,8 @@ class PreviewWindow:
         if key in (ord("q"), ord("Q"), 27):
             self._disable("key")
             return False
+        if key in (ord("r"), ord("R")):
+            self.reset_requested = True
         return True
 
     def _show_tk(self, frame: np.ndarray) -> bool:
@@ -148,6 +151,8 @@ class PreviewWindow:
             root.protocol("WM_DELETE_WINDOW", lambda: self._disable("close"))
             for seq in ("<q>", "<Q>", "<Escape>"):
                 root.bind(seq, lambda _e: self._disable("key"))
+            for seq in ("<r>", "<R>"):
+                root.bind(seq, lambda _e: setattr(self, "reset_requested", True))
             label = tk.Label(root)
             label.pack()
             self._tk_root = root

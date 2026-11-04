@@ -33,10 +33,27 @@ orbbec_cam1_pub:
     depth_topic: /orbbec/cam1/depth/image_raw
     info_topic: /orbbec/cam1/color/camera_info
 
+orbbec_cam2_pub:
+  ros__parameters:
+    camera_index: 2
+    frame_id: orbbec_cam2
+    publish_rate_hz: 6.0
+    publish_depth: true
+    publish_camera_info: true
+    show_preview: false
+    open_delay_s: 0.0
+    color_topic: /orbbec/cam2/color/image_raw
+    depth_topic: /orbbec/cam2/depth/image_raw
+    info_topic: /orbbec/cam2/color/camera_info
+
 orbbec_dual_view:
   ros__parameters:
     cam0_color_topic: /orbbec/cam0/color/image_raw
     cam1_color_topic: /orbbec/cam1/color/image_raw
+    cam2_color_topic: /orbbec/cam2/color/image_raw
+    cam0_depth_topic: /orbbec/cam0/depth/image_raw
+    cam1_depth_topic: /orbbec/cam1/depth/image_raw
+    cam2_depth_topic: /orbbec/cam2/depth/image_raw
     max_height: 480
     refresh_hz: 15.0
     # Furnace boxes/labels on cam0 (furnace_state/furnace.json, up to 4 slots).

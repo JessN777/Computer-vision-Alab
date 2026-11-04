@@ -41,3 +41,5 @@ Set `"host": "192.168.x.x"` in `ur_fk_config.json`.
 ## Align pendant base to cameras
 
 If the skeleton is shifted, set `R_ur_to_vision` / `t_ur_to_vision_mm` in `ur_fk_config.json` after asymmetric-board / cell_frames calib so UR base matches vision `ur_base`.
+
+An identity `R_ur_to_vision` means “not calibrated”: the graph stands the arm up (UR Z → camera up) instead of drawing it along the camera’s depth axis. Joint angles come from RTDE or `ur_joints.json`. When blue joints are visible they are a **check** — the chain is refit so those points land on the kinematic joints, and the HUD says `KIN CHECK ok` or `KIN CHECK off`. The corner inset is the upright kinematic stick, not the raw blue blobs.
