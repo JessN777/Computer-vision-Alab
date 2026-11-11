@@ -1,7 +1,0 @@
-setuptools
-numpy
-opencv-python
-PyYAML
-
-[test]
-pytest

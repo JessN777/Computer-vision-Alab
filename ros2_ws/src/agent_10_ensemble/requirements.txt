@@ -1,7 +1,0 @@
-numpy>=1.23
-opencv-python>=4.8
-scikit-learn>=1.3
-# Optional recall branch (auto-loaded when weights exist):
-ultralytics>=8.0
-# ROS2 (provided by workspace / robostack; not pip on Windows typically):
-# rclpy, sensor_msgs, vision_msgs, launch_ros
