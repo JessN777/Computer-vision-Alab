@@ -1,9 +1,16 @@
-"""6-slot blue joint bank: HSV detections + Kalman coast in ur_base (no NN)."""
+"""6-slot blue joint bank: HSV detections + Kalman coast in ur_base (no NN).
+
+``JointBank.ingest_cam`` turns color-pixel blue boxes into tracks. Coasting
+keeps IDs when a cap leaves view; ``draw_tracked_blue`` only paints live blobs.
+Purple tape (``low_purple_tape_uv``) is the legacy origin marker.
+"""
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -15,7 +22,6 @@ from .baby_blue_draw import (
     _blue_point_mm,
     _unproject_mm,
     baby_blue_mask,
-    find_purple_tape,
     format_distance_mm,
     is_base_blue_box,
     median_depth_mm,
@@ -31,6 +37,66 @@ DEFAULT_NMS_PX = 40.0
 DEFAULT_DET_STALE_S = 0.35
 DEFAULT_TAPE_HOLD_S = 3.0  # keep last purple origin if the mask flickers
 DEFAULT_NN_HOLD_S = 12.0
+
+
+def _lowest_blue_cap_uv(bgr: np.ndarray) -> Optional[np.ndarray]:
+    """Center of the lowest large light-blue joint cap in the frame."""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (85, 40, 120), (110, 180, 255))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    fh = bgr.shape[0]
+    best_y = -1.0
+    best: Optional[np.ndarray] = None
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if cv2.contourArea(c) < 800.0 or w < 24 or h < 24:
+            continue
+        cy = y + 0.5 * h
+        if cy < 0.35 * fh:
+            continue
+        if cy > best_y:
+            best_y = cy
+            best = np.array([x + 0.5 * w, cy], dtype=np.float64)
+    return best
+
+
+def low_purple_tape_uv(bgr: np.ndarray, cam: str | None = None) -> Optional[np.ndarray]:
+    """Center of the purple strip on the pedestal, beside the lower blue cap."""
+    from .baby_blue_draw import purple_tape_mask
+
+    mask = purple_tape_mask(bgr)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    fh, fw = bgr.shape[:2]
+    cands: list[tuple[float, float, float]] = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area = float(max(cv2.contourArea(c), w * h * 0.6))
+        if area < 12.0 or w < 5 or h < 2 or w < h:
+            continue
+        cy = y + 0.5 * h
+        cx = x + 0.5 * w
+        # Bottom edge of cam0 is the table, not the tape on the pedestal.
+        if cy < 0.55 * fh or cy > 0.88 * fh:
+            continue
+        if cam == "cam0" and (cx < 0.15 * fw or cx > 0.70 * fw):
+            continue
+        cands.append((cx, cy, area))
+    if not cands:
+        return None
+    cap = _lowest_blue_cap_uv(bgr)
+    if cap is not None:
+        near = []
+        for cx, cy, area in cands:
+            du = cx - float(cap[0])
+            dv = cy - float(cap[1])
+            dist = (du * du + dv * dv) ** 0.5
+            if dist < 160.0:
+                near.append((dist, -area, cx, cy))
+        if near:
+            near.sort()
+            return np.array([near[0][2], near[0][3]], dtype=np.float64)
+    cands.sort(key=lambda item: item[2], reverse=True)
+    return np.array([cands[0][0], cands[0][1]], dtype=np.float64)
 
 
 @dataclass
@@ -60,6 +126,7 @@ class TrackView:
     coasting: bool
     is_base: bool
     p_base: Optional[np.ndarray]
+    p_cam: Optional[np.ndarray] = None  # camera-frame XYZ (mm) when depth is valid
     # Position relative to purple tape (0,0): radius mm + yaw degrees in XY.
     r_mm: Optional[float] = None
     ang_deg: Optional[float] = None
@@ -178,33 +245,149 @@ def _new_kalman(p_base: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return state, P
 
 
+_NAN_LOGGED: set[str] = set()
+
+
+def finite_blue_box(x, y, w, h) -> bool:
+    """A blob the bank can place. Zero area or a non-finite corner is skipped."""
+    try:
+        vals = (float(x), float(y), float(w), float(h))
+    except (TypeError, ValueError):
+        _skip_nan("blue box not numeric")
+        return False
+    if not all(np.isfinite(v) for v in vals):
+        _skip_nan("blue box coordinate")
+        return False
+    if vals[2] * vals[3] < 1.0:
+        _skip_nan("blue box zero area")
+        return False
+    return True
+
+
+def _skip_nan(where: str) -> None:
+    if where in _NAN_LOGGED:
+        return
+    _NAN_LOGGED.add(where)
+    print(f"blue joint NaN skipped: {where}", flush=True)
+
+
+def _mm_small(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    A = np.asarray(a, dtype=np.float64)
+    B = np.asarray(b, dtype=np.float64)
+    out = np.zeros((A.shape[0], B.shape[1]), dtype=np.float64)
+    for i in range(A.shape[0]):
+        for j in range(B.shape[1]):
+            acc = 0.0
+            for k in range(A.shape[1]):
+                acc += float(A[i, k]) * float(B[k, j])
+            out[i, j] = acc
+    return out
+
+
+def _solve3(S: np.ndarray, b: np.ndarray) -> Optional[np.ndarray]:
+    """Solve S x = b. A zero pivot returns None instead of NaN."""
+    M = np.asarray(S, dtype=np.float64).copy()
+    x = np.asarray(b, dtype=np.float64).reshape(3).copy()
+    for col in range(3):
+        pivot = col
+        best = abs(float(M[col, col]))
+        for r in range(col + 1, 3):
+            v = abs(float(M[r, col]))
+            if v > best:
+                best = v
+                pivot = r
+        if best < 1e-8 or not np.isfinite(best):
+            return None
+        if pivot != col:
+            row = M[col].copy()
+            M[col] = M[pivot]
+            M[pivot] = row
+            x[col], x[pivot] = float(x[pivot]), float(x[col])
+        div = float(M[col, col])
+        for j in range(3):
+            M[col, j] = float(M[col, j]) / div
+        x[col] = float(x[col]) / div
+        for r in range(3):
+            if r == col:
+                continue
+            factor = float(M[r, col])
+            if factor == 0.0:
+                continue
+            for j in range(3):
+                M[r, j] = float(M[r, j]) - factor * float(M[col, j])
+            x[r] = float(x[r]) - factor * float(x[col])
+    if not np.isfinite(x).all():
+        return None
+    return x
+
+
 def _kalman_predict(state: np.ndarray, P: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray]:
     dt = max(1e-3, float(dt))
+    state = np.asarray(state, dtype=np.float64).reshape(6).copy()
+    P = np.asarray(P, dtype=np.float64).reshape(6, 6).copy()
+    if not np.isfinite(state).all() or not np.isfinite(P).all():
+        _skip_nan("kalman predict state")
+        return _new_kalman(np.zeros(3))
+    for i in range(3):
+        state[i] = float(state[i]) + dt * float(state[i + 3])
     F = np.eye(6, dtype=np.float64)
     F[0, 3] = dt
     F[1, 4] = dt
     F[2, 5] = dt
+    PF = _mm_small(P, F.T)
+    P = _mm_small(F, PF)
     q_pos = 50.0 * dt
     q_vel = 200.0 * dt
-    Q = np.diag([q_pos, q_pos, q_pos, q_vel, q_vel, q_vel]).astype(np.float64)
-    state = F @ state
-    P = F @ P @ F.T + Q
+    for i in range(3):
+        P[i, i] += q_pos
+        P[i + 3, i + 3] += q_vel
     return state, P
 
 
 def _kalman_update(
     state: np.ndarray, P: np.ndarray, z: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    H = np.zeros((3, 6), dtype=np.float64)
-    H[0, 0] = H[1, 1] = H[2, 2] = 1.0
-    R = np.eye(3, dtype=np.float64) * 900.0  # ~30 mm std
+    """Position update. K = P[:, :3] inv(S) with S = P[:3,:3] + 900 I, looped."""
+    state = np.asarray(state, dtype=np.float64).reshape(6).copy()
+    P = np.asarray(P, dtype=np.float64).reshape(6, 6).copy()
     z = np.asarray(z, dtype=np.float64).reshape(3)
-    y = z - H @ state
-    S = H @ P @ H.T + R
-    K = P @ H.T @ np.linalg.inv(S)
-    state = state + K @ y
-    P = (np.eye(6) - K @ H) @ P
-    return state, P
+    if not np.isfinite(z).all() or not np.isfinite(state).all() or not np.isfinite(P).all():
+        _skip_nan("kalman update measurement")
+        return state, P
+    S = P[:3, :3].copy()
+    for i in range(3):
+        S[i, i] = float(S[i, i]) + 900.0
+    eye = np.eye(3, dtype=np.float64)
+    inv_cols = []
+    for col in range(3):
+        solved = _solve3(S, eye[col])
+        if solved is None:
+            _skip_nan("kalman update singular")
+            return state, P
+        inv_cols.append(solved)
+    K = np.zeros((6, 3), dtype=np.float64)
+    for i in range(6):
+        for j in range(3):
+            acc = 0.0
+            for k in range(3):
+                acc += float(P[i, k]) * float(inv_cols[j][k])
+            K[i, j] = acc
+    for i in range(6):
+        acc = float(state[i])
+        for k in range(3):
+            acc += float(K[i, k]) * (float(z[k]) - float(state[k]))
+        state[i] = acc
+    P_new = P.copy()
+    for r in range(6):
+        for c in range(6):
+            acc = float(P[r, c])
+            for k in range(3):
+                acc -= float(K[r, k]) * float(P[k, c])
+            P_new[r, c] = acc
+    if not np.isfinite(state).all() or not np.isfinite(P_new).all():
+        _skip_nan("kalman update result")
+        return state, P
+    return state, P_new
 
 
 class JointBank:
@@ -240,6 +423,8 @@ class JointBank:
         self._tape_p_cam: dict[str, np.ndarray] = {}
         self._tape_last_t: dict[str, float] = {}
         self._base_xy: dict[str, tuple[float, float]] = {}
+        self._origin_lock: dict[str, dict] = {}
+        self._robotics_root: Optional[Path] = None
         self.motion = None
         self.nn_steps = 0
         try:
@@ -247,16 +432,129 @@ class JointBank:
             from .cell_frames import default_cell_frames_path
 
             root = default_cell_frames_path().parent
+            self._robotics_root = root
             self.motion = JointMotionNet(root / "joint_motion_mlp.npz")
             self.nn_steps = int(self.motion.steps)
         except Exception:
             self.motion = None
+        if self._robotics_root is None:
+            try:
+                from .cell_frames import default_cell_frames_path
+
+                self._robotics_root = default_cell_frames_path().parent
+            except Exception:
+                self._robotics_root = None
+        self._load_origin_lock()
 
     def hud_counts(self) -> tuple[int, int, int]:
         """Return (live, predicted/coasting, capacity)."""
         live = sum(1 for t in self.tracks if t is not None and not t.coasting)
         coast = sum(1 for t in self.tracks if t is not None and t.coasting)
         return live, coast, self.num_joints
+
+    def _origin_json_path(self) -> Optional[Path]:
+        if self._robotics_root is None:
+            return None
+        return Path(self._robotics_root) / "base_origin.json"
+
+    def _origin_reset_path(self) -> Optional[Path]:
+        if self._robotics_root is None:
+            return None
+        return Path(self._robotics_root) / "RESET_BASE_ORIGIN"
+
+    def _load_origin_lock(self) -> None:
+        path = self._origin_json_path()
+        self._origin_lock = {}
+        if path is None or not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if data.get("reset"):
+            return
+        for cam, rec in (data.get("cams") or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            if "u" not in rec or "v" not in rec:
+                continue
+            self._origin_lock[str(cam)] = rec
+
+    def _save_origin_lock(self) -> None:
+        path = self._origin_json_path()
+        if path is None:
+            return
+        payload = {
+            "note": (
+                "Locked (0,0) is the purple tape on the robot pedestal. "
+                "Both cameras store that same physical point. "
+                "After you bump a camera, create RESET_BASE_ORIGIN in this "
+                "folder and the next tape sighting stores the new offset."
+            ),
+            "cams": self._origin_lock,
+        }
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def consume_origin_reset(self) -> bool:
+        """Drop the locked base if the operator asked for a new offset."""
+        flag = self._origin_reset_path()
+        path = self._origin_json_path()
+        reset = flag is not None and flag.is_file()
+        if path is not None and path.is_file():
+            try:
+                if json.loads(path.read_text(encoding="utf-8")).get("reset"):
+                    reset = True
+            except Exception:
+                pass
+        if not reset:
+            return False
+        self._origin_lock.clear()
+        self._tape_box.clear()
+        self._tape_p_cam.clear()
+        self._tape_last_t.clear()
+        self.j0_p_cam = None
+        self.origin_ready = False
+        if flag is not None and flag.is_file():
+            try:
+                flag.unlink()
+            except Exception:
+                pass
+        self._save_origin_lock()
+        print("base origin reset — next purple-tape sighting locks (0,0)")
+        return True
+
+    def locked_uv(self, cam: str | None) -> Optional[np.ndarray]:
+        if not cam:
+            return None
+        rec = self._origin_lock.get(cam)
+        if not rec:
+            return None
+        return np.array([float(rec["u"]), float(rec["v"])], dtype=np.float64)
+
+    def lock_origin(
+        self,
+        cam: str,
+        u: float,
+        v: float,
+        p_cam: Optional[np.ndarray] = None,
+    ) -> bool:
+        """Freeze this camera's (0,0) pixel. Returns True only the first time."""
+        if cam in self._origin_lock:
+            return False
+        rec: dict = {"u": float(u), "v": float(v)}
+        if p_cam is not None:
+            rec["p_cam_mm"] = [float(x) for x in np.asarray(p_cam, dtype=np.float64).reshape(3)]
+        self._origin_lock[cam] = rec
+        self._save_origin_lock()
+        print(f"base origin locked {cam} uv=({u:.0f},{v:.0f})")
+        return True
+
+    def lock_origin_depth(self, cam: str, p_cam: np.ndarray) -> None:
+        rec = self._origin_lock.get(cam)
+        if rec is None or rec.get("p_cam_mm"):
+            return
+        rec["p_cam_mm"] = [float(x) for x in np.asarray(p_cam, dtype=np.float64).reshape(3)]
+        self._save_origin_lock()
 
     def ingest_cam(
         self,
@@ -271,18 +569,46 @@ class JointBank:
         frame_w: int,
         now: Optional[float] = None,
         bgr: Optional[np.ndarray] = None,
+        cam_K: Optional[np.ndarray] = None,
+        color_hw: Optional[tuple[int, int]] = None,
     ) -> list[TrackView]:
-        """Ingest one camera's HSV boxes; return views for that cam pane."""
+        """Ingest one camera's HSV boxes; return views for that cam pane.
+
+        ``boxes``/``mask``/``bgr`` stay in **color** pixels. Depth is the
+        sensor's native frame (often a different size). ``cam_K`` is the real
+        color intrinsics; unprojection uses that K and samples depth after an
+        explicit color→depth scale.
+        """
         now = time.monotonic() if now is None else float(now)
+        hw = color_hw or (bgr.shape[:2] if bgr is not None else (frame_h, frame_w))
+        if cam_K is not None:
+            K = np.asarray(cam_K, dtype=np.float64).reshape(3, 3)
+            fxc, fyc, cxc, cyc = (
+                float(K[0, 0]),
+                float(K[1, 1]),
+                float(K[0, 2]),
+                float(K[1, 2]),
+            )
+        else:
+            fxc, fyc, cxc, cyc = (
+                float(fx),
+                float(fx),
+                0.5 * float(hw[1]),
+                0.5 * float(hw[0]),
+            )
         dets = self._boxes_to_dets(
             cam,
             boxes,
             depth,
             mask,
             pose=pose,
-            fx=fx,
+            fx=fxc,
+            fy=fyc,
+            cx=cxc,
+            cy=cyc,
             frame_h=frame_h,
             frame_w=frame_w,
+            color_hw=hw,
         )
         dets = _nms_image(dets, self.nms_px)
         self._remember_base_xy(
@@ -291,11 +617,13 @@ class JointBank:
             color_hw=bgr.shape[:2] if bgr is not None else (frame_h, frame_w),
             det_hw=(frame_h, frame_w),
         )
-        self._store_tape_box(cam, bgr, depth, fx=fx)
+        self._store_tape_box(
+            cam, bgr, depth, fx=fxc, fy=fyc, cx=cxc, cy=cyc, color_hw=hw
+        )
         self._cam_dets[cam] = (now, dets)
         self._lock_cam_boxes[cam] = dets
         self._align_tape_heading(
-            cam, dets, fx=fx, frame_w=frame_w, frame_h=frame_h
+            cam, dets, fx=fxc, fy=fyc, cx=cxc, cy=cyc, frame_w=frame_w, frame_h=frame_h
         )
         self._associate(now)
         return self.views_for_cam(cam, frame_w=frame_w, frame_h=frame_h)
@@ -328,26 +656,54 @@ class JointBank:
         depth: Optional[np.ndarray],
         *,
         fx: float = 520.0,
+        fy: Optional[float] = None,
+        cx: Optional[float] = None,
+        cy: Optional[float] = None,
+        color_hw: Optional[tuple[int, int]] = None,
     ) -> None:
         if bgr is None:
             return
-        depth_for_tape = (
-            depth
-            if depth is not None and depth.shape[:2] == bgr.shape[:2]
-            else None
-        )
-        near = self._base_xy.get(cam)
-        # Wider radius: cam1 often sees the tape as a small strip beside the base.
-        max_d = max(180.0, 0.28 * float(max(bgr.shape[:2])))
-        tape = find_purple_tape(
-            bgr,
-            depth_mm=depth_for_tape,
-            near_xy=near,
-            max_dist_px=max_d,
-            min_area=6,
-        )
-        if tape is None:
-            # Keep last purple origin briefly so r/@angles don't vanish on flicker.
+        fy_use = float(fx) if fy is None else float(fy)
+        cx_use = 0.5 * float(bgr.shape[1]) if cx is None else float(cx)
+        cy_use = 0.5 * float(bgr.shape[0]) if cy is None else float(cy)
+        hw = color_hw or bgr.shape[:2]
+
+        def _tape_xyz(u: float, v: float):
+            if depth is None:
+                return None
+            d_mm = median_depth_mm(
+                depth,
+                max(0, int(u - 6)),
+                max(0, int(v - 4)),
+                12,
+                8,
+                color_hw=hw,
+            )
+            if d_mm is None or d_mm <= 50.0:
+                return None
+            return np.asarray(
+                _unproject_mm(u, v, float(d_mm), fx=fx, fy=fy_use, cx=cx_use, cy=cy_use),
+                dtype=np.float64,
+            )
+
+        self.consume_origin_reset()
+        locked = self.locked_uv(cam)
+        if locked is not None:
+            u, v = float(locked[0]), float(locked[1])
+            self._tape_box[cam] = (int(u - 10), int(v - 4), 20, 8)
+            self._tape_last_t[cam] = time.monotonic()
+            self.tape_seen = True
+            rec = self._origin_lock.get(cam) or {}
+            if rec.get("p_cam_mm"):
+                self._tape_p_cam[cam] = np.asarray(rec["p_cam_mm"], dtype=np.float64)
+            else:
+                p = _tape_xyz(u, v)
+                if p is not None:
+                    self._tape_p_cam[cam] = p
+                    self.lock_origin_depth(cam, p)
+            return
+        spot = low_purple_tape_uv(bgr, cam)
+        if spot is None:
             age = time.monotonic() - self._tape_last_t.get(cam, 0.0)
             if cam in self._tape_box and age <= DEFAULT_TAPE_HOLD_S:
                 return
@@ -355,27 +711,14 @@ class JointBank:
             self._tape_p_cam.pop(cam, None)
             self._tape_last_t.pop(cam, None)
             return
-        x, y, w, h, d_mm = tape
-        self._tape_box[cam] = (int(x), int(y), int(w), int(h))
+        u, v = float(spot[0]), float(spot[1])
+        self._tape_box[cam] = (int(u - 10), int(v - 4), 20, 8)
         self._tape_last_t[cam] = time.monotonic()
         self.tape_seen = True
-        if d_mm is not None and d_mm > 50.0:
-            if depth is not None and depth.shape[:2] == bgr.shape[:2]:
-                dh, dw = depth.shape[:2]
-            else:
-                dh, dw = bgr.shape[:2]
-            self._tape_p_cam[cam] = np.asarray(
-                _unproject_mm(
-                    x + 0.5 * w,
-                    y + 0.5 * h,
-                    float(d_mm),
-                    fx=fx,
-                    fy=fx,
-                    cx=0.5 * dw,
-                    cy=0.5 * dh,
-                ),
-                dtype=np.float64,
-            )
+        p_cam = _tape_xyz(u, v)
+        if p_cam is not None:
+            self._tape_p_cam[cam] = p_cam
+        self.lock_origin(cam, u, v, p_cam)
 
     def _align_tape_heading(
         self,
@@ -383,10 +726,16 @@ class JointBank:
         dets: list[Detection],
         *,
         fx: float,
+        fy: Optional[float] = None,
+        cx: Optional[float] = None,
+        cy: Optional[float] = None,
         frame_w: int,
         frame_h: int,
     ) -> None:
         """Shift this camera so the purple tape is exactly (0,0,0)."""
+        fy_use = float(fx) if fy is None else float(fy)
+        cx_use = 0.5 * float(frame_w) if cx is None else float(cx)
+        cy_use = 0.5 * float(frame_h) if cy is None else float(cy)
         origin = self._tape_p_cam.get(cam)
         if origin is None:
             box = self._tape_box.get(cam)
@@ -403,9 +752,9 @@ class JointBank:
                     y + 0.5 * h,
                     z,
                     fx=fx,
-                    fy=fx,
-                    cx=0.5 * frame_w,
-                    cy=0.5 * frame_h,
+                    fy=fy_use,
+                    cx=cx_use,
+                    cy=cy_use,
                 ),
                 dtype=np.float64,
             )
@@ -431,16 +780,21 @@ class JointBank:
         *,
         pose: Optional[CamPose],
         fx: float,
+        fy: Optional[float] = None,
+        cx: Optional[float] = None,
+        cy: Optional[float] = None,
         frame_h: int,
         frame_w: int,
+        color_hw: Optional[tuple[int, int]] = None,
     ) -> list[Detection]:
         out: list[Detection] = []
-        if depth is not None:
-            dh, dw = depth.shape[:2]
-            cx_f, cy_f = 0.5 * dw, 0.5 * dh
-        else:
-            cx_f = cy_f = 0.0
+        fy_use = float(fx) if fy is None else float(fy)
+        cx_f = 0.5 * float(frame_w) if cx is None else float(cx)
+        cy_f = 0.5 * float(frame_h) if cy is None else float(cy)
+        hw = color_hw or (frame_h, frame_w)
         for x, y, w, h, d in boxes:
+            if not finite_blue_box(x, y, w, h):
+                continue
             p_cam = None
             p_base = None
             d_use = d
@@ -454,16 +808,24 @@ class JointBank:
                     int(h),
                     d,
                     fx=fx,
-                    fy=fx,
+                    fy=fy_use,
                     cx=cx_f,
                     cy=cy_f,
+                    color_hw=hw,
                 )
-                if bp is not None:
+                if bp is not None and np.isfinite(np.asarray(bp[0], dtype=np.float64)).all():
                     p_cam = np.asarray(bp[0], dtype=np.float64)
                     d_use = bp[1]
+                    if d_use is not None and not np.isfinite(float(d_use)):
+                        _skip_nan("blue depth")
+                        p_cam = None
+                        d_use = None
                     # Tentative; _rebase_to_j0 overwrites once pedestal is known.
                     if pose is not None and pose.ready:
                         p_base = cam_to_base(p_cam, pose)
+                        if p_base is not None and not np.isfinite(np.asarray(p_base)).all():
+                            _skip_nan("p_base")
+                            p_base = None
             is_base = is_base_blue_box(
                 int(x), int(y), int(w), int(h), frame_h, y_frac=0.45
             )
@@ -627,7 +989,11 @@ class JointBank:
             ):
                 window = np.asarray(tr.hist[-6:], dtype=np.float64).reshape(6, 3)
                 nxt = self.motion.predict_next(window)
-                tr.state[:3] = 0.7 * nxt + 0.3 * tr.state[:3]
+                nxt = np.asarray(nxt, dtype=np.float64).reshape(3)
+                if not np.isfinite(nxt).all() or not np.isfinite(tr.state[:3]).all():
+                    _skip_nan("motion net coast")
+                else:
+                    tr.state[:3] = 0.7 * nxt + 0.3 * tr.state[:3]
                 tr.hist.append(tr.state[:3].copy())
                 tr.hist = tr.hist[-24:]
                 tr.nn_out = True
@@ -866,20 +1232,23 @@ class JointBank:
                 if tr.seen_this_frame:
                     coasting = False
             if coasting and tr.has_base_frame:
-                z = max(200.0, float(abs(tr.state[2])) if abs(tr.state[2]) > 1 else 800.0)
-                # Prefer NN / Kalman state for where to draw the highlight.
-                age = time.monotonic() - tr.last_seen_t
-                if tr.nn_out:
-                    sx = int(tr.state[0] * 520.0 / z * 0.02)
-                    sy = int(tr.state[1] * 520.0 / z * 0.02)
+                if not np.isfinite(tr.state).all() or not finite_blue_box(x, y, w, h):
+                    _skip_nan("coast highlight")
                 else:
-                    sx = int(tr.state[3] * age * 520.0 / z)
-                    sy = int(tr.state[4] * age * 520.0 / z)
-                x = int(np.clip(x + sx, 0, max(0, frame_w - w)))
-                y = int(np.clip(y + sy, 0, max(0, frame_h - h)))
-                # Keep a usable highlight size even when the joint is off-mask.
-                w = max(28, int(w))
-                h = max(28, int(h))
+                    z_state = float(tr.state[2])
+                    z = 800.0 if abs(z_state) <= 1.0 else max(200.0, abs(z_state))
+                    age = time.monotonic() - tr.last_seen_t
+                    if tr.nn_out:
+                        sx = float(tr.state[0]) * 520.0 / z * 0.02
+                        sy = float(tr.state[1]) * 520.0 / z * 0.02
+                    else:
+                        sx = float(tr.state[3]) * age * 520.0 / z
+                        sy = float(tr.state[4]) * age * 520.0 / z
+                    if np.isfinite(sx) and np.isfinite(sy):
+                        x = int(np.clip(float(x) + sx, 0, max(0, frame_w - w)))
+                        y = int(np.clip(float(y) + sy, 0, max(0, frame_h - h)))
+                        w = max(28, int(w))
+                        h = max(28, int(h))
             p_base = tr.state[:3].copy() if tr.has_base_frame else None
             r_mm, ang_deg = _polar_from_origin(p_base)
             if r_mm is None:
@@ -897,6 +1266,7 @@ class JointBank:
                     coasting=coasting,
                     is_base=bool(tr.is_base or tr.track_id == 0),
                     p_base=p_base,
+                    p_cam=None if tr.p_cam is None else np.asarray(tr.p_cam, dtype=np.float64).reshape(3),
                     r_mm=r_mm,
                     ang_deg=ang_deg,
                     nn_out=bool(tr.nn_out),
@@ -906,23 +1276,22 @@ class JointBank:
         return views
 
 
-def views_to_boxes(
-    views: list[TrackView], *, include_coasting: bool = True
+
+def views_to_prox_boxes(
+    views: list[TrackView],
+    *,
+    include_base: bool = False,
 ) -> list[tuple[int, int, int, int, Optional[float]]]:
-    out = []
-    for v in views:
-        if v.coasting and not include_coasting:
-            continue
-        out.append((v.x, v.y, v.w, v.h, v.d_mm))
-    return out
+    """One box per track id for proximity. Coasting ghosts are skipped.
 
-
-def views_to_prox_boxes(views: list[TrackView]) -> list[tuple[int, int, int, int, Optional[float]]]:
-    """One box per track id for proximity; skip base and coasting-only ghosts."""
+    The pedestal cap is included when checking the gray equipment mask.
+    """
     seen: set[int] = set()
     out = []
     for v in views:
-        if v.is_base or v.coasting or v.track_id in seen:
+        if v.coasting or v.track_id in seen:
+            continue
+        if v.is_base and not include_base:
             continue
         seen.add(v.track_id)
         out.append((v.x, v.y, v.w, v.h, v.d_mm))
@@ -934,11 +1303,13 @@ def draw_tracked_blue(
     views: list[TrackView],
     *,
     show_mask: bool = True,
+    gray_mask: Optional[np.ndarray] = None,
     depth_mm: Optional[np.ndarray] = None,
     hud_live: int = 0,
     hud_coast: int = 0,
     hud_cap: int = 6,
     tape_box: Optional[tuple[int, int, int, int]] = None,
+    show_origin: bool = True,
 ) -> np.ndarray:
     """Draw J0..J5 with strong highlights — live and predicted / out-of-view."""
     out = bgr.copy()
@@ -957,64 +1328,64 @@ def draw_tracked_blue(
         overlay = cv2.addWeighted(out, 1.0, tint, 0.40, 0)
         out = np.where(keep[..., None] > 0, overlay, out)
 
-    # Predicted / NN-out: still paint a filled highlight so joints stay visible.
-    for v in views:
-        if not v.coasting:
-            continue
-        y0, y1 = max(0, v.y), min(out.shape[0], v.y + v.h)
-        x0, x1 = max(0, v.x), min(out.shape[1], v.x + v.w)
-        if y1 <= y0 or x1 <= x0:
-            continue
-        patch = out[y0:y1, x0:x1]
-        tint = np.zeros_like(patch)
-        tint[:] = (80, 220, 255) if v.nn_out else (160, 200, 255)
-        out[y0:y1, x0:x1] = cv2.addWeighted(patch, 0.55, tint, 0.45, 0)
+    if show_mask and gray_mask is not None and gray_mask.shape[:2] == out.shape[:2]:
+        tint = np.zeros_like(out)
+        tint[:] = (170, 170, 170)
+        overlay = cv2.addWeighted(out, 1.0, tint, 0.45, 0)
+        out = np.where(gray_mask[..., None] > 0, overlay, out)
 
     # Draw spokes from purple tape (0,0) → each joint so relative layout is clear.
     tape_c: Optional[tuple[int, int]] = None
-    if tape_box is not None:
+    if show_origin and tape_box is not None:
         tx, ty, tw, th = tape_box
         tape_c = (int(tx + 0.5 * tw), int(ty + 0.5 * th))
-    else:
-        for v in views:
-            if v.is_base or v.track_id == 0:
-                tape_c = (int(v.x + 0.5 * v.w), int(v.y + 0.5 * v.h))
-                break
+        cv2.circle(out, tape_c, 6, (180, 40, 180), -1, cv2.LINE_AA)
+        cv2.putText(
+            out,
+            "0,0",
+            (tape_c[0] + 8, max(16, tape_c[1] - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (180, 40, 180),
+            2,
+            cv2.LINE_AA,
+        )
 
+    # Coasting tracks stay in the bank for association, but are not drawn
+    # (dashed boxes were landing off the arm).
     for v in views:
+        if v.coasting:
+            continue
         d_mm = v.d_mm
-        if depth_mm is not None and not v.coasting:
-            d_mm = median_depth_mm(depth_mm, v.x, v.y, v.w, v.h, mask=mask)
+        if depth_mm is not None:
+            d_mm = median_depth_mm(
+                depth_mm,
+                v.x,
+                v.y,
+                v.w,
+                v.h,
+                mask=mask,
+                color_hw=bgr.shape[:2],
+            )
         if v.nn_out:
-            color = (0, 200, 255)  # bright orange-cyan for NN carry
+            color = (0, 200, 255)
             thickness = 3
-        elif v.coasting:
-            color = (100, 220, 255)
-            thickness = 2
         else:
             color = BOX_COLOR
             thickness = 2
         jcx, jcy = int(v.x + 0.5 * v.w), int(v.y + 0.5 * v.h)
         if tape_c is not None and not (v.is_base or v.track_id == 0):
             cv2.line(out, tape_c, (jcx, jcy), (200, 120, 200), 2, cv2.LINE_AA)
-        if v.coasting:
-            _dashed_rect(out, v.x, v.y, v.w, v.h, color, thickness)
-            cv2.circle(out, (jcx, jcy), max(6, min(v.w, v.h) // 3), color, 2, cv2.LINE_AA)
-        else:
-            cv2.rectangle(out, (v.x, v.y), (v.x + v.w, v.y + v.h), color, thickness)
-            cv2.circle(out, (jcx, jcy), 4, color, -1, cv2.LINE_AA)
+        cv2.rectangle(out, (v.x, v.y), (v.x + v.w, v.y + v.h), color, thickness)
+        cv2.circle(out, (jcx, jcy), 4, color, -1, cv2.LINE_AA)
         if v.is_base or v.track_id == 0:
-            tag = "J0 purple (0,0)"
+            tag = "blue"
         else:
             tag = f"J{v.track_id}"
             if v.r_mm is not None:
                 tag += f" r={v.r_mm / 10.0:.0f}cm"
             if v.ang_deg is not None:
                 tag += f" @{v.ang_deg:.0f}deg"
-        if v.coasting and v.nn_out:
-            tag += " NN-out"
-        elif v.coasting:
-            tag += " pred"
         tag += f" {format_distance_mm(d_mm)}"
         cv2.putText(
             out,
@@ -1037,17 +1408,18 @@ def draw_tracked_blue(
         2,
         cv2.LINE_AA,
     )
-    cv2.putText(
-        out,
-        "ORIGIN purple (0,0)  |  NN predicts joints out of view",
-        (12, out.shape[0] - 18),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (200, 230, 255),
-        1,
-        cv2.LINE_AA,
-    )
-    if tape_box is not None:
+    if show_origin:
+        cv2.putText(
+            out,
+            "ORIGIN purple (0,0)  |  NN predicts joints out of view",
+            (12, out.shape[0] - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 230, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    if show_origin and tape_box is not None:
         tx, ty, tw, th = tape_box
         cv2.rectangle(out, (tx, ty), (tx + tw, ty + th), (180, 0, 180), 2)
         cv2.putText(
@@ -1061,38 +1433,3 @@ def draw_tracked_blue(
             cv2.LINE_AA,
         )
     return out
-
-
-def _dashed_rect(
-    img: np.ndarray, x: int, y: int, w: int, h: int, color: tuple, thickness: int
-) -> None:
-    pts = [
-        ((x, y), (x + w, y)),
-        ((x + w, y), (x + w, y + h)),
-        ((x + w, y + h), (x, y + h)),
-        ((x, y + h), (x, y)),
-    ]
-    for (x0, y0), (x1, y1) in pts:
-        _dashed_line(img, (x0, y0), (x1, y1), color, thickness)
-
-
-def _dashed_line(
-    img: np.ndarray,
-    p0: tuple[int, int],
-    p1: tuple[int, int],
-    color: tuple,
-    thickness: int,
-    dash: int = 8,
-) -> None:
-    x0, y0 = p0
-    x1, y1 = p1
-    dist = float(np.hypot(x1 - x0, y1 - y0))
-    if dist < 1:
-        return
-    n = max(1, int(dist // dash))
-    for i in range(0, n, 2):
-        a = i / n
-        b = min(1.0, (i + 1) / n)
-        qa = (int(x0 + a * (x1 - x0)), int(y0 + a * (y1 - y0)))
-        qb = (int(x0 + b * (x1 - x0)), int(y0 + b * (y1 - y0)))
-        cv2.line(img, qa, qb, color, thickness, cv2.LINE_AA)

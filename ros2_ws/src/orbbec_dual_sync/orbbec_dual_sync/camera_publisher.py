@@ -17,6 +17,7 @@ import traceback
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -158,6 +159,11 @@ class OrbbecCameraPublisher(Node):
         self.context.on_shutdown(self._request_shutdown)
         self.camera_index = int(self.get_parameter("camera_index").value)
         self.frame_id = str(self.get_parameter("frame_id").value)
+        # Optional K if CAP_OBSENSOR reports no intrinsics. Left unset.
+        ncam = self.camera_index
+        for _axis in ("fx", "fy", "cx", "cy"):
+            self.declare_parameter(f"cam{ncam}_{_axis}")
+        self._intrinsics_warn_t = 0.0
         rate = float(self.get_parameter("publish_rate_hz").value)
         self.publish_depth = bool(self.get_parameter("publish_depth").value)
         self.publish_camera_info = bool(self.get_parameter("publish_camera_info").value)
@@ -388,6 +394,29 @@ class OrbbecCameraPublisher(Node):
             self._read_misses = 0
             self._recovering = False
 
+    def _log_intrinsics_none(self, text: str) -> None:
+        now = time.monotonic()
+        if now - float(self._intrinsics_warn_t) < 10.0:
+            return
+        self._intrinsics_warn_t = now
+        self.get_logger().warn(text)
+
+    def _param_intrinsics(self):
+        """camN_fx/fy/cx/cy when set. None if any of the four is unset."""
+        ncam = int(self.camera_index)
+        vals = []
+        for axis in ("fx", "fy", "cx", "cy"):
+            param = self.get_parameter(f"cam{ncam}_{axis}")
+            if param.type_ == Parameter.Type.NOT_SET or param.value is None:
+                return None
+            try:
+                vals.append(float(param.value))
+            except (TypeError, ValueError):
+                return None
+        if vals[0] <= 0.0 or vals[1] <= 0.0:
+            return None
+        return tuple(vals)
+
     def _camera_info(self, color: np.ndarray, stamp) -> CameraInfo:
         h, w = color.shape[:2]
         info = CameraInfo()
@@ -395,17 +424,29 @@ class OrbbecCameraPublisher(Node):
         info.header.frame_id = self.frame_id
         info.height = int(h)
         info.width = int(w)
-        if not self._intrinsics_initialized:
-            self._intrinsics_initialized = True
-            if self._cam.capture is not None:
-                try:
-                    self._intrinsics = self._dc.intrinsics_from_capture(
-                        self._cam.capture, w, h
+        if self._intrinsics is None and self._cam is not None and self._cam.capture is not None:
+            got = None
+            try:
+                got = self._dc.intrinsics_from_capture(self._cam.capture, w, h)
+            except Exception as exc:
+                got = None
+                self._log_intrinsics_none(f"Camera intrinsics unavailable: {exc}")
+            else:
+                if got is None:
+                    self._log_intrinsics_none(
+                        f"cam{self.camera_index}: intrinsics_from_capture returned None"
                     )
-                except Exception as exc:
-                    self.get_logger().warn(f"Camera intrinsics unavailable: {exc}")
+                else:
+                    self._intrinsics = got
+                    self._intrinsics_initialized = True
+        fx = fy = cx = cy = None
         if self._intrinsics is not None:
             fx, fy, cx, cy = self._intrinsics
+        else:
+            fallback = self._param_intrinsics()
+            if fallback is not None:
+                fx, fy, cx, cy = fallback
+        if fx is not None:
             info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
             info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
             info.d = [0.0, 0.0, 0.0, 0.0, 0.0]

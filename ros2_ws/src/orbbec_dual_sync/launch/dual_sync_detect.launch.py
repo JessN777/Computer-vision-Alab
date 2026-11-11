@@ -53,6 +53,17 @@ def generate_launch_description() -> LaunchDescription:
         respawn=True,
         respawn_delay=3.0,
     )
+    cam2 = Node(
+        package="orbbec_dual_sync",
+        executable="orbbec_camera_publisher",
+        name="orbbec_cam2_pub",
+        output="screen",
+        # No rate_override: cam2 keeps its own lower rate + color-only from the
+        # yaml so the third camera fits the remaining USB bandwidth.
+        parameters=[config],
+        respawn=True,
+        respawn_delay=3.0,
+    )
     dual_view = Node(
         package="orbbec_dual_sync",
         executable="orbbec_dual_view",
@@ -198,9 +209,10 @@ def generate_launch_description() -> LaunchDescription:
             ),
             cam0,
             TimerAction(period=20.0, actions=[cam1]),
-            # After both publishers; dual view needs cam0+cam1 topics.
-            # dual_view after both pubs are streaming (cam1 opens at 20s).
-            TimerAction(period=38.0, actions=[dual_view]),
+            # After cam1 has the USB lock. cam2 is the third Orbbec.
+            TimerAction(period=36.0, actions=[cam2]),
+            # dual_view after cam2 has had time to open.
+            TimerAction(period=52.0, actions=[dual_view]),
             # After cam0 publisher; furnace overlay only needs cam0 topic.
             TimerAction(period=12.0, actions=[furnace_overlay]),
             # After cam1 publisher starts; overlay only needs the topic.

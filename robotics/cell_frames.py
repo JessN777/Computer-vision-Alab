@@ -34,6 +34,7 @@ PERPENDICULAR_R_CAM1 = np.array(
 LAYOUT_PERPENDICULAR = "perpendicular_90"
 LAYOUT_SCENE_TAPE = "scene_tape"
 LAYOUT_ASYMMETRIC_BOARD = "asymmetric_board"
+LAYOUT_ARM_TAGS = "arm_tags"
 
 
 @dataclass
@@ -129,6 +130,8 @@ def save_cell_frames(cf: CellFrames) -> None:
             "layout=perpendicular_90: cam0 R=I, cam1 R=yaw+90 about Y. "
             "layout=scene_tape: R,t from shared-scene ORB + purple-tape Umeyama. "
             "layout=asymmetric_board: R,t from asymmetric checkerboard/circle stereoCalibrate. "
+            "layout=arm_tags: R,t from arm stickers across several paused poses "
+            "(robotics/arm_camera_calib.py). Kept as saved; not replaced by the 90 deg prior. "
             "bootstrap updates t so each camera maps the pedestal/tape to the origin."
         ),
         "bootstrap_from_blue_base": bool(cf.bootstrap_from_blue_base),
@@ -156,8 +159,19 @@ def save_cell_frames(cf: CellFrames) -> None:
 
 
 def cam_to_base(p_cam_mm: np.ndarray, pose: CamPose) -> np.ndarray:
+    """p_base = R @ p_cam + t, written as a loop (this PC's NumPy GEMM aborts)."""
     p = np.asarray(p_cam_mm, dtype=np.float64).reshape(3)
-    return pose.R @ p + pose.t_mm.reshape(3)
+    R = np.asarray(pose.R, dtype=np.float64).reshape(3, 3)
+    t = np.asarray(pose.t_mm, dtype=np.float64).reshape(3)
+    out = np.zeros(3, dtype=np.float64)
+    for i in range(3):
+        out[i] = (
+            float(R[i, 0]) * float(p[0])
+            + float(R[i, 1]) * float(p[1])
+            + float(R[i, 2]) * float(p[2])
+            + float(t[i])
+        )
+    return out
 
 
 def bootstrap_pose_from_base_landmark(
@@ -169,7 +183,13 @@ def bootstrap_pose_from_base_landmark(
     """Set translation so the seen pedestal/tape maps to ur_base origin."""
     R_use = np.eye(3, dtype=np.float64) if R is None else np.asarray(R, dtype=np.float64)
     p = np.asarray(p_base_in_cam_mm, dtype=np.float64).reshape(3)
-    t = -R_use @ p
+    t = np.zeros(3, dtype=np.float64)
+    for i in range(3):
+        t[i] = -(
+            float(R_use[i, 0]) * float(p[0])
+            + float(R_use[i, 1]) * float(p[1])
+            + float(R_use[i, 2]) * float(p[2])
+        )
     return CamPose(frame_id=frame_id, R=R_use, t_mm=t, ready=True)
 
 
@@ -201,78 +221,3 @@ def format_base_retreat(p_joint_base_mm: np.ndarray) -> str:
     )
 
 
-def relative_cam1_from_cam0(cf: CellFrames) -> tuple[np.ndarray, np.ndarray]:
-    """Return R,t such that X_cam1 = R @ X_cam0 + t (mm).
-
-    With p_base = R_i @ p_cam_i + t_i:
-      R_0 @ X0 + t0 = R_1 @ X1 + t1
-      X1 = R_1.T @ R_0 @ X0 + R_1.T @ (t0 - t1)
-    """
-    R0, t0 = cf.cam0.R, cf.cam0.t_mm.reshape(3)
-    R1, t1 = cf.cam1.R, cf.cam1.t_mm.reshape(3)
-    R = R1.T @ R0
-    t = R1.T @ (t0 - t1)
-    return R, t
-
-
-def apply_scene_stereo_to_cell_frames(
-    cf: CellFrames,
-    R_0_to_1: np.ndarray,
-    t_0_to_1_mm: np.ndarray,
-    *,
-    origin_cam0_mm: Optional[np.ndarray] = None,
-    origin_cam1_mm: Optional[np.ndarray] = None,
-) -> CellFrames:
-    """Install stereo R,t (cam0→cam1) into cell poses; bootstrap origins when given.
-
-    cam0 stays identity in ur_base when origin_cam0 is provided (tape/pedestal).
-    cam1 R/t are set so relative stereo matches the solve and both map origin→0.
-    """
-    R_rel = np.asarray(R_0_to_1, dtype=np.float64).reshape(3, 3)
-    t_rel = np.asarray(t_0_to_1_mm, dtype=np.float64).reshape(3)
-
-    if origin_cam0_mm is not None:
-        p0 = np.asarray(origin_cam0_mm, dtype=np.float64).reshape(3)
-        cf.cam0 = bootstrap_pose_from_base_landmark(
-            p0, R=np.eye(3), frame_id=cf.cam0.frame_id
-        )
-    else:
-        cf.cam0.R = np.eye(3, dtype=np.float64)
-        cf.cam0.ready = True
-
-    # Prefer bootstrapping cam1 from its own tape observation when available.
-    if origin_cam1_mm is not None:
-        p1 = np.asarray(origin_cam1_mm, dtype=np.float64).reshape(3)
-        # R_cam1_to_base such that relative stereo holds with cam0 = I, t0 = -p0:
-        # X1 = R_rel @ X0 + t_rel
-        # p_base = R0 @ X0 + t0 = X0 + t0  (R0=I)
-        # p_base = R1 @ X1 + t1
-        # => R1 @ (R_rel @ X0 + t_rel) + t1 = X0 + t0  for all X0
-        # => R1 @ R_rel = I  => R1 = R_rel.T
-        # => R1 @ t_rel + t1 = t0  => t1 = t0 - R1 @ t_rel
-        R1 = R_rel.T.copy()
-        t0 = cf.cam0.t_mm.reshape(3)
-        t1 = t0 - R1 @ t_rel
-        # Also force tape in cam1 to origin: t1' = -R1 @ p1; blend by preferring tape.
-        t1_tape = -R1 @ p1
-        cf.cam1 = CamPose(
-            frame_id=cf.cam1.frame_id,
-            R=R1,
-            t_mm=t1_tape,
-            ready=True,
-        )
-        # Keep relative stereo consistent with tape-anchored cam1 when possible.
-        _ = t1  # computed for reference / future soft blend
-    else:
-        R1 = R_rel.T.copy()
-        t0 = cf.cam0.t_mm.reshape(3)
-        t1 = t0 - R1 @ t_rel
-        cf.cam1 = CamPose(
-            frame_id=cf.cam1.frame_id,
-            R=R1,
-            t_mm=t1,
-            ready=True,
-        )
-
-    cf.layout = LAYOUT_SCENE_TAPE
-    return cf

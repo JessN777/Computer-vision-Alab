@@ -1,4 +1,9 @@
-"""Track pale baby-blue / cyan UR joint plastic via HSV color mask (no NN)."""
+"""Track pale baby-blue / cyan UR joint plastic via HSV color mask (no NN).
+
+Used by ``blue_joint_tracks`` and ``dual_view_node``. Color boxes stay in color
+pixels; sample depth after ``color_uv_to_depth_uv`` / ``scale_color_box_to_depth``,
+then unproject with the color camera matrix from camera_info.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +13,12 @@ import cv2
 import numpy as np
 
 # Seeded from user baby-blue joint crops (OpenCV HSV: H 0-179).
-# Slightly relaxed for pale / highlighted caps; mean-S gate still rejects white panels.
-DEFAULT_HSV_LO = (88, 36, 140)
+# The pedestal cap is paler (mean S about 38) than the upper joints.
+# Mean-S gate still rejects white panels.
+DEFAULT_HSV_LO = (88, 24, 140)
 DEFAULT_HSV_HI = (104, 180, 255)
 DEFAULT_MIN_AREA = 220
-DEFAULT_MIN_MEAN_S = 42.0
+DEFAULT_MIN_MEAN_S = 36.0
 DEFAULT_MIN_FILL = 0.18
 DEFAULT_MAX_BOXES = 12
 DEFAULT_PROXIMITY_MM = 100.0  # 10 cm
@@ -69,90 +75,93 @@ def purple_tape_mask(
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((2, 4), np.uint8))
     return mask
 
+def color_uv_to_depth_uv(
+    u: float,
+    v: float,
+    color_hw: tuple[int, int],
+    depth_hw: tuple[int, int],
+) -> tuple[float, float]:
+    """Map a color-pixel (u, v) into the depth frame.
 
-def find_purple_tape(
-    bgr: np.ndarray,
-    *,
-    min_area: int = 20,
-    depth_mm: Optional[np.ndarray] = None,
-    near_xy: Optional[tuple[float, float]] = None,
-    max_dist_px: float = 160.0,
-) -> Optional[tuple[int, int, int, int, Optional[float]]]:
-    """Largest purple-tape blob near the base. Far red/purple edges ignored.
-
-    If ``near_xy`` is missing, prefer the lower half of the frame (pedestal).
+    CAP_OBSENSOR publishes native-resolution depth (not D2C). When the two
+    frames share the same optical model and only differ in size, this is a
+    uniform scale. It is not a substitute for Orbbec AlignFilter.
     """
-    mask = purple_tape_mask(bgr)
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best = None
-    best_score = -1.0
-    fh, fw = bgr.shape[:2]
-    if near_xy is None:
-        nx, ny = 0.5 * fw, 0.72 * fh
-        max_dist_px = max(float(max_dist_px), 0.35 * float(max(fh, fw)))
-    else:
-        nx, ny = float(near_xy[0]), float(near_xy[1])
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        area = float(max(cv2.contourArea(c), w * h * 0.6))
-        if area < float(min_area):
-            continue
-        # Other camera often sees a short / tiny horizontal band.
-        if w < 3 or h < 2:
-            continue
-        cx, cy = x + 0.5 * w, y + 0.5 * h
-        dist2 = (cx - nx) ** 2 + (cy - ny) ** 2
-        if dist2 > float(max_dist_px) ** 2:
-            continue
-        aspect = max(w, h) / max(1.0, float(min(w, h)))
-        if aspect < 1.1 and area < 40:
-            continue
-        score = area - 0.02 * dist2
-        if score <= best_score:
-            continue
-        best_score = score
-        d = median_depth_mm(depth_mm, x, y, w, h, mask=mask) if depth_mm is not None else None
-        best = (int(x), int(y), int(w), int(h), d)
-    return best
+    ch, cw = int(color_hw[0]), int(color_hw[1])
+    dh, dw = int(depth_hw[0]), int(depth_hw[1])
+    if ch <= 0 or cw <= 0 or (ch, cw) == (dh, dw):
+        return float(u), float(v)
+    return float(u) * dw / float(cw), float(v) * dh / float(ch)
 
 
-def purple_tape_long_axis(
-    bgr: np.ndarray,
-    box: tuple[int, int, int, int],
-) -> Optional[tuple[tuple[float, float], tuple[float, float], float]]:
-    """Centroid UV, unit long-axis UV, and length_px for a purple-tape box.
+def depth_uv_to_color_uv(
+    u: float,
+    v: float,
+    color_hw: tuple[int, int],
+    depth_hw: tuple[int, int],
+) -> tuple[float, float]:
+    """Inverse of ``color_uv_to_depth_uv``."""
+    ch, cw = int(color_hw[0]), int(color_hw[1])
+    dh, dw = int(depth_hw[0]), int(depth_hw[1])
+    if dh <= 0 or dw <= 0 or (ch, cw) == (dh, dw):
+        return float(u), float(v)
+    return float(u) * cw / float(dw), float(v) * ch / float(dh)
 
-    Used by scene extrinsics yaw lock. Returns None if the blob is too small.
-    """
-    x, y, w, h = [int(v) for v in box]
-    if w < 3 or h < 2:
-        return None
-    mask = purple_tape_mask(bgr)
-    roi = mask[y : y + h, x : x + w]
-    cnts, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        cx, cy = x + 0.5 * w, y + 0.5 * h
-        axis = (1.0, 0.0) if w >= h else (0.0, 1.0)
-        return (cx, cy), axis, float(max(w, h))
-    c = max(cnts, key=cv2.contourArea)
-    c = c + np.array([[[x, y]]], dtype=c.dtype)
-    rect = cv2.minAreaRect(c)
-    (rw, rh) = rect[1]
-    angle = float(rect[2])
-    if rw < rh:
-        length_px = float(rh)
-        ang_rad = np.deg2rad(angle + 90.0)
-    else:
-        length_px = float(rw)
-        ang_rad = np.deg2rad(angle)
-    axis = (float(np.cos(ang_rad)), float(np.sin(ang_rad)))
-    m = cv2.moments(c)
-    if abs(m["m00"]) < 1e-6:
-        cx, cy = x + 0.5 * w, y + 0.5 * h
-    else:
-        cx = float(m["m10"] / m["m00"])
-        cy = float(m["m01"] / m["m00"])
-    return (cx, cy), axis, max(1.0, length_px)
+
+def scale_color_box_to_depth(
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    color_hw: tuple[int, int],
+    depth_hw: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Map a color-pixel box into the depth frame (resolution scale only)."""
+    u0, v0 = color_uv_to_depth_uv(x, y, color_hw, depth_hw)
+    u1, v1 = color_uv_to_depth_uv(x + w, y + h, color_hw, depth_hw)
+    return (
+        int(round(u0)),
+        int(round(v0)),
+        max(1, int(round(u1 - u0))),
+        max(1, int(round(v1 - v0))),
+    )
+
+
+def scale_depth_box_to_color(
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    color_hw: tuple[int, int],
+    depth_hw: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Map a depth-pixel box back into the color frame."""
+    u0, v0 = depth_uv_to_color_uv(x, y, color_hw, depth_hw)
+    u1, v1 = depth_uv_to_color_uv(x + w, y + h, color_hw, depth_hw)
+    return (
+        int(round(u0)),
+        int(round(v0)),
+        max(1, int(round(u1 - u0))),
+        max(1, int(round(v1 - v0))),
+    )
+
+
+def depth_frame_intrinsics(
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    color_hw: tuple[int, int],
+    depth_hw: tuple[int, int],
+) -> tuple[float, float, float, float]:
+    """Color intrinsics scaled into the depth frame (same optical model,
+    different resolution). Returns (fx, fy, cx, cy) in depth pixels."""
+    ch, cw = int(color_hw[0]), int(color_hw[1])
+    dh, dw = int(depth_hw[0]), int(depth_hw[1])
+    if ch <= 0 or cw <= 0 or (ch, cw) == (dh, dw):
+        return float(fx), float(fy), float(cx), float(cy)
+    sx, sy = dw / float(cw), dh / float(ch)
+    return float(fx) * sx, float(fy) * sy, float(cx) * sx, float(cy) * sy
 
 
 def median_depth_mm(
@@ -163,11 +172,22 @@ def median_depth_mm(
     h: int,
     *,
     mask: Optional[np.ndarray] = None,
+    color_hw: Optional[tuple[int, int]] = None,
 ) -> Optional[float]:
-    """Median depth (mm) in box; ignores zeros / invalid. Depth must be mm."""
+    """Median depth (mm) in box; ignores zeros / invalid. Depth must be mm.
+
+    If ``color_hw`` is given and the depth frame is a different resolution, the
+    box (in color pixels) is mapped into depth pixels first; the color-resolution
+    ``mask`` no longer matches that patch, so a stable center crop is used.
+    """
     if depth_mm is None or depth_mm.size == 0:
         return None
     dh, dw = depth_mm.shape[:2]
+    if color_hw is not None:
+        ch, cw = int(color_hw[0]), int(color_hw[1])
+        if ch > 0 and cw > 0 and (ch, cw) != (dh, dw):
+            x, y, w, h = scale_color_box_to_depth(x, y, w, h, color_hw, (dh, dw))
+            mask = None
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(dw, x + w), min(dh, y + h)
     if x1 <= x0 or y1 <= y0:
@@ -230,6 +250,65 @@ def silver_equipment_mask(
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     return mask
+
+
+def gray_equipment_mask(
+    bgr: np.ndarray,
+    blue_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Neutral gray and aluminum that is not the robot arm or the table.
+
+    The arm is the gray component touching the baby-blue joint caps. The table
+    is the wide gray component along the bottom edge. Everything else (rack,
+    extrusions, machine frames) stays, and a blue joint within 10 cm of it
+    raises the proximity error.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    neutral = cv2.inRange(
+        hsv, np.array([0, 0, 45], np.uint8), np.array([179, 48, 200], np.uint8)
+    )
+    gray = cv2.bitwise_or(neutral, silver_equipment_mask(bgr))
+    if blue_mask is not None and blue_mask.shape[:2] == gray.shape[:2]:
+        gray = cv2.bitwise_and(gray, cv2.bitwise_not(blue_mask))
+    gray = cv2.morphologyEx(gray, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    pieces = cv2.erode(gray, np.ones((5, 5), np.uint8), iterations=1)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(pieces)
+    h, w = gray.shape[:2]
+    drop_lut = np.zeros(int(count), np.uint8)
+    blue_touch = None
+    if blue_mask is not None and blue_mask.shape[:2] == gray.shape[:2]:
+        blue_touch = cv2.dilate(blue_mask, np.ones((31, 31), np.uint8), iterations=1)
+        touched = labels[blue_touch > 0].ravel()
+        touch_counts = np.bincount(touched, minlength=int(count))
+        for idx in range(1, int(count)):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < 40 or int(touch_counts[idx]) == 0:
+                continue
+            # A small piece stuck to a blue cap is the arm. A rack or machine
+            # that only meets the cap along one edge is kept.
+            frac = float(touch_counts[idx]) / float(area)
+            if area < 8000 or frac > 0.45:
+                drop_lut[idx] = 1
+    for idx in range(1, int(count)):
+        if int(stats[idx, cv2.CC_STAT_AREA]) < 40:
+            continue
+        if drop_lut[idx]:
+            continue
+        bw = int(stats[idx, cv2.CC_STAT_WIDTH])
+        top = int(stats[idx, cv2.CC_STAT_TOP])
+        bh = int(stats[idx, cv2.CC_STAT_HEIGHT])
+        wide = bw > int(0.35 * w)
+        low = float(centroids[idx, 1]) > 0.72 * h and (top + bh) >= h - 8
+        if wide and low:
+            drop_lut[idx] = 1
+    if int(drop_lut.sum()) > 0:
+        dropped = np.zeros(pieces.shape, np.uint8)
+        dropped[drop_lut[labels] > 0] = 255
+        dropped = cv2.dilate(dropped, np.ones((15, 15), np.uint8), iterations=1)
+        gray = cv2.bitwise_and(gray, cv2.bitwise_not(dropped))
+    if blue_touch is not None:
+        gray = cv2.bitwise_and(gray, cv2.bitwise_not(blue_touch))
+    return gray
 
 
 def equipment_obstacle_mask(
@@ -313,9 +392,18 @@ def _blue_point_mm(
     fy: float,
     cx: float,
     cy: float,
+    color_hw: Optional[tuple[int, int]] = None,
 ) -> Optional[tuple[tuple[float, float, float], float]]:
+    """Color-pixel box + depth frame → camera-frame XYZ (mm).
+
+    ``x,y,w,h`` and ``fx,fy,cx,cy`` are in the **color** frame. Depth is
+    sampled after an explicit color→depth scale (native Orbbec depth is not
+    the same resolution as color). Unprojection uses the color ray.
+    """
     if d_blue is None:
-        d_blue = median_depth_mm(depth_mm, x, y, w, h, mask=blue_mask)
+        d_blue = median_depth_mm(
+            depth_mm, x, y, w, h, mask=blue_mask, color_hw=color_hw
+        )
     if d_blue is None:
         return None
     u = x + 0.5 * w
@@ -337,6 +425,107 @@ def depth_from_known_height_mm(
     return float(fy_px) * float(real_h_mm) / float(pixel_h)
 
 
+def _chain_from_base(
+    boxes: list,
+    frame_h: int,
+) -> list:
+    """Blue joints ordered from the pedestal out. Each step is one link."""
+    if not boxes:
+        return []
+    base = None
+    for b in boxes:
+        if is_base_blue_box(b[0], b[1], b[2], b[3], frame_h):
+            base = b
+            break
+    if base is None:
+        base = max(boxes, key=lambda b: b[1] + 0.5 * b[3])
+    chain = [base]
+    rest = [b for b in boxes if b is not base]
+    while rest:
+        ax = chain[-1][0] + 0.5 * chain[-1][2]
+        ay = chain[-1][1] + 0.5 * chain[-1][3]
+        nxt = min(
+            rest,
+            key=lambda b: (b[0] + 0.5 * b[2] - ax) ** 2
+            + (b[1] + 0.5 * b[3] - ay) ** 2,
+        )
+        chain.append(nxt)
+        rest = [b for b in rest if b is not nxt]
+    return chain
+
+
+def _carve_link_tube(gray: np.ndarray, chain: list, fx: float) -> np.ndarray:
+    """Remove the silver tube between blue joints so a cap is not measured against its own link."""
+    if gray is None or len(chain) < 2:
+        return gray
+    arm = np.zeros(gray.shape, np.uint8)
+    for a, b in zip(chain, chain[1:]):
+        ax, ay = int(a[0] + 0.5 * a[2]), int(a[1] + 0.5 * a[3])
+        bx, by = int(b[0] + 0.5 * b[2]), int(b[1] + 0.5 * b[3])
+        za = float(a[4]) if a[4] else 600.0
+        zb = float(b[4]) if b[4] else za
+        z = max(200.0, 0.5 * (za + zb))
+        rad = int(round(55.0 * float(fx) / z))
+        thick = max(18, min(96, 2 * rad))
+        cv2.line(arm, (ax, ay), (bx, by), 255, thick)
+        cv2.circle(arm, (ax, ay), max(10, rad), 255, -1)
+        cv2.circle(arm, (bx, by), max(10, rad), 255, -1)
+    return cv2.bitwise_and(gray, cv2.bitwise_not(arm))
+
+
+def _nearest_gray_gap_mm(
+    gray: np.ndarray,
+    depth_mm: np.ndarray,
+    u: float,
+    v: float,
+    origin: tuple[float, float, float],
+    *,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    search_px: int = 160,
+    ignore_px: int = 18,
+) -> Optional[float]:
+    """4th-closest stable gray pixel, in mm. Ignores the pixel under the sample."""
+    dh, dw = depth_mm.shape[:2]
+    x, y = int(round(u)), int(round(v))
+    rad = max(40, int(search_px))
+    x0, y0 = max(0, x - rad), max(0, y - rad)
+    x1, y1 = min(dw, x + rad), min(dh, y + rad)
+    g_roi = gray[y0:y1, x0:x1]
+    if g_roi.size == 0 or cv2.countNonZero(g_roi) < 8:
+        return None
+    gd = depth_mm[y0:y1, x0:x1].astype(np.float32)
+    med = cv2.medianBlur(np.clip(gd, 0, 65535).astype(np.uint16), 5).astype(np.float32)
+    ys, xs = np.where(
+        (g_roi > 0)
+        & (np.abs(gd - med) < 40.0)
+        & np.isfinite(gd)
+        & (gd > 50.0)
+        & (gd < 8000.0)
+    )
+    if xs.size < 8:
+        return None
+    step = max(1, int(xs.size // 200))
+    gaps: list[float] = []
+    for i in range(0, int(xs.size), step):
+        pu = float(xs[i] + x0)
+        pv = float(ys[i] + y0)
+        if ((pu - u) ** 2 + (pv - v) ** 2) ** 0.5 < float(ignore_px):
+            continue
+        gz = float(gd[ys[i], xs[i]])
+        # Same depth as the link is the arm itself, not a separate machine.
+        if abs(gz - float(origin[2])) < 80.0:
+            continue
+        gp = _unproject_mm(pu, pv, gz, fx=fx, fy=fy, cx=cx, cy=cy)
+        gaps.append(_dist3d_mm(origin, gp))
+    if len(gaps) < 12:
+        return None
+    gaps.sort()
+    return gaps[3]
+
+
 def proximity_alerts(
     depth_mm: Optional[np.ndarray],
     boxes: list[tuple[int, int, int, int, Optional[float]]],
@@ -345,11 +534,15 @@ def proximity_alerts(
     bgr: Optional[np.ndarray] = None,
     thresh_mm: float = DEFAULT_PROXIMITY_MM,
     fx_px: float = 520.0,
+    fy_px: Optional[float] = None,
+    cx: Optional[float] = None,
+    cy: Optional[float] = None,
     skip_base: bool = True,
     black_v_max: int = DEFAULT_BLACK_V_MAX,
     search_px: int = 180,
     rack_xywh: Optional[tuple[int, int, int, int]] = None,
     rack_height_mm: float = DEFAULT_RACK_HEIGHT_MM,
+    gray_mask: Optional[np.ndarray] = None,
 ) -> list[tuple[int, int, int, int, float, str]]:
     """Alert when a non-base blue joint is within ``thresh_mm`` of equipment.
 
@@ -370,8 +563,9 @@ def proximity_alerts(
         return []
 
     fx = max(50.0, float(fx_px))
-    fy = fx
-    cx_f, cy_f = 0.5 * dw, 0.5 * dh
+    fy = fx if fy_px is None else max(50.0, float(fy_px))
+    cx_f = 0.5 * dw if cx is None else float(cx)
+    cy_f = 0.5 * dh if cy is None else float(cy)
 
     z_rack: Optional[float] = None
     rack_box: Optional[tuple[int, int, int, int]] = None
@@ -389,14 +583,19 @@ def proximity_alerts(
     arm = cv2.bitwise_or(body, blue_mask)
     arm = cv2.dilate(arm, np.ones((21, 21), np.uint8), iterations=1)
     obstacle = cv2.bitwise_and(equip, cv2.bitwise_not(arm))
-    if cv2.countNonZero(obstacle) < 40 and z_rack is None:
+    gray = None
+    if gray_mask is not None and gray_mask.shape[:2] == (dh, dw):
+        gray = gray_mask
+    chain = _chain_from_base(boxes, dh)
+    if gray is not None and len(chain) >= 2:
+        # L1's own silver tube is not equipment. Leave the rack beside it.
+        gray = _carve_link_tube(gray, chain, fx)
+    if cv2.countNonZero(obstacle) < 40 and z_rack is None and gray is None:
         return []
 
     alerts: list[tuple[int, int, int, int, float, str]] = []
     rad = max(40, int(search_px))
     for x, y, w, h, d_blue in boxes:
-        if skip_base and is_base_blue_box(x, y, w, h, dh):
-            continue
         bp = _blue_point_mm(
             depth_mm, blue_mask, x, y, w, h, d_blue, fx=fx, fy=fy, cx=cx_f, cy=cy_f
         )
@@ -405,6 +604,63 @@ def proximity_alerts(
         p_blue, d_blue_f = bp
         best: Optional[float] = None
         best_label = "equip"
+        is_base = skip_base and is_base_blue_box(x, y, w, h, dh)
+
+        # Gray equipment (rack, extrusions) uses the depth camera directly.
+        # The arm and the table are already out of this mask.
+        if gray is not None:
+            gx0 = max(0, x - rad)
+            gy0 = max(0, y - rad)
+            gx1 = min(dw, x + w + rad)
+            gy1 = min(dh, y + h + rad)
+            g_roi = gray[gy0:gy1, gx0:gx1].copy()
+            # The silver link under a blue cap is not equipment. Ignore gray
+            # on the joint itself.
+            margin = 28
+            ix0 = max(0, int(x - margin - gx0))
+            iy0 = max(0, int(y - margin - gy0))
+            ix1 = min(g_roi.shape[1], int(x + w + margin - gx0))
+            iy1 = min(g_roi.shape[0], int(y + h + margin - gy0))
+            if ix1 > ix0 and iy1 > iy0:
+                g_roi[iy0:iy1, ix0:ix1] = 0
+            gd_roi = depth_mm[gy0:gy1, gx0:gx1].astype(np.float32)
+            depth_u = np.clip(gd_roi, 0, 65535).astype(np.uint16)
+            depth_med = cv2.medianBlur(depth_u, 5).astype(np.float32)
+            stable = np.abs(gd_roi - depth_med) < 40.0
+            gys, gxs = np.where(
+                (g_roi > 0)
+                & stable
+                & np.isfinite(gd_roi)
+                & (gd_roi > 50.0)
+                & (gd_roi < 8000.0)
+            )
+            gaps: list[float] = []
+            if gxs.size >= 8:
+                gstep = max(1, int(gxs.size // 200))
+                for i in range(0, int(gxs.size), gstep):
+                    gz = float(gd_roi[gys[i], gxs[i]])
+                    # The cap's own housing and the surface it sits on share
+                    # its depth. A separate machine is in front of or behind that.
+                    if abs(gz - d_blue_f) < 80.0:
+                        continue
+                    pu = float(gxs[i] + gx0)
+                    pv = float(gys[i] + gy0)
+                    gp = _unproject_mm(
+                        pu, pv, gz, fx=fx, fy=fy, cx=cx_f, cy=cy_f
+                    )
+                    gaps.append(_dist3d_mm(p_blue, gp))
+            if len(gaps) >= 12:
+                gaps.sort()
+                # A few closest stable pixels, so one depth speck does not
+                # count and a far wall in the same window does not hide the rack.
+                gap_g = gaps[3]
+                if best is None or gap_g < best:
+                    best = gap_g
+                    best_label = "gray"
+
+        # The pedestal cap sits on the table. It is allowed to be near gray.
+        if is_base:
+            continue
 
         # Explicit blue ↔ rack plane check using similar-triangles rack depth
         if rack_box is not None and z_rack is not None:
@@ -475,6 +731,50 @@ def proximity_alerts(
             alerts.append(
                 (int(x), int(y), int(w), int(h), float(best), best_label)
             )
+
+    # Link L1 is the tube from the pedestal cap to the next blue joint.
+    # The cap can sit ~12 cm off the rack while the tube itself is in it.
+    if gray is not None and len(chain) >= 2:
+        a, b = chain[0], chain[1]
+        pa = _blue_point_mm(
+            depth_mm, blue_mask, a[0], a[1], a[2], a[3], a[4],
+            fx=fx, fy=fy, cx=cx_f, cy=cy_f,
+        )
+        pb = _blue_point_mm(
+            depth_mm, blue_mask, b[0], b[1], b[2], b[3], b[4],
+            fx=fx, fy=fy, cx=cx_f, cy=cy_f,
+        )
+        if pa is not None and pb is not None:
+            best_l1 = None
+            best_uv = None
+            for t in (0.35, 0.5, 0.65):
+                u = (1.0 - t) * (a[0] + 0.5 * a[2]) + t * (b[0] + 0.5 * b[2])
+                v = (1.0 - t) * (a[1] + 0.5 * a[3]) + t * (b[1] + 0.5 * b[3])
+                origin = (
+                    (1.0 - t) * pa[0][0] + t * pb[0][0],
+                    (1.0 - t) * pa[0][1] + t * pb[0][1],
+                    (1.0 - t) * pa[0][2] + t * pb[0][2],
+                )
+                gap_l1 = _nearest_gray_gap_mm(
+                    gray, depth_mm, u, v, origin,
+                    fx=fx, fy=fy, cx=cx_f, cy=cy_f,
+                )
+                if gap_l1 is None:
+                    continue
+                if best_l1 is None or gap_l1 < best_l1:
+                    best_l1 = gap_l1
+                    best_uv = (u, v)
+            if best_l1 is not None and best_l1 <= float(thresh_mm) and best_uv is not None:
+                alerts.append(
+                    (
+                        int(best_uv[0]) - 20,
+                        int(best_uv[1]) - 20,
+                        40,
+                        40,
+                        float(best_l1),
+                        "L1",
+                    )
+                )
     return alerts
 
 
@@ -611,7 +911,7 @@ def draw_proximity_error(
     gap_cm = min(float(a[4]) for a in alerts) / 10.0
     lines = [
         "ERROR: PROXIMITY",
-        f"BLUE < {thresh_cm:.0f}cm OF EQUIPMENT",
+        f"BLUE < {thresh_cm:.0f}cm OF GRAY / EQUIPMENT",
         f"closest gap ~ {gap_cm:.1f}cm",
     ]
     y = 28
@@ -633,7 +933,7 @@ def draw_proximity_error(
         cv2.rectangle(out, (x, y0), (x + bw, y0 + bh), ALERT_COLOR, 3)
         cv2.putText(
             out,
-            f"NEAR EQUIP {gap / 10.0:.1f}cm",
+            f"NEAR {item[5] if len(item) > 5 else 'EQUIP'} {gap / 10.0:.1f}cm",
             (x, max(banner_h + 20, y0 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -682,59 +982,11 @@ def find_baby_blue_boxes(
         quality = min(0.99, 0.45 * fill + 0.55 * (mean_s / 120.0))
         if quality < 0.35:
             continue
-        d_mm = median_depth_mm(depth_mm, x, y, w, h, mask=mask)
+        # bgr is the color frame; depth may be the sensor's native resolution.
+        d_mm = median_depth_mm(
+            depth_mm, x, y, w, h, mask=mask, color_hw=bgr.shape[:2]
+        )
         boxes.append((int(x), int(y), int(w), int(h), d_mm, quality))
     boxes.sort(key=lambda b: (b[5], -(b[2] * b[3])), reverse=True)
     return [(x, y, w, h, d) for x, y, w, h, d, _q in boxes[: max(1, int(max_boxes))]]
 
-
-def draw_baby_blue_overlay(
-    bgr: np.ndarray,
-    *,
-    min_area: int = DEFAULT_MIN_AREA,
-    max_boxes: int = DEFAULT_MAX_BOXES,
-    show_mask: bool = True,
-    hsv_lo: tuple[int, int, int] = DEFAULT_HSV_LO,
-    hsv_hi: tuple[int, int, int] = DEFAULT_HSV_HI,
-    boxes: Optional[list[tuple[int, int, int, int, Optional[float]]]] = None,
-    depth_mm: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Draw boxes labeled with camera distance (not confidence)."""
-    out = bgr.copy()
-    mask = baby_blue_mask(bgr, hsv_lo=hsv_lo, hsv_hi=hsv_hi)
-    if boxes is None:
-        boxes = find_baby_blue_boxes(
-            bgr,
-            min_area=min_area,
-            max_boxes=max_boxes,
-            hsv_lo=hsv_lo,
-            hsv_hi=hsv_hi,
-            depth_mm=depth_mm,
-        )
-    # Only tint pixels inside accepted boxes (not the whole loose mask)
-    if show_mask and boxes:
-        keep = np.zeros_like(mask)
-        for x, y, w, h, _d in boxes:
-            keep[y : y + h, x : x + w] = cv2.bitwise_and(
-                mask[y : y + h, x : x + w], 255
-            )
-        tint = np.zeros_like(out)
-        tint[:] = MASK_TINT
-        overlay = cv2.addWeighted(out, 1.0, tint, 0.40, 0)
-        out = np.where(keep[..., None] > 0, overlay, out)
-    for i, (x, y, w, h, d_mm) in enumerate(boxes):
-        # Refresh depth if caller passed a fresh depth map
-        if depth_mm is not None:
-            d_mm = median_depth_mm(depth_mm, x, y, w, h, mask=mask)
-        cv2.rectangle(out, (x, y), (x + w, y + h), BOX_COLOR, 2)
-        cv2.putText(
-            out,
-            f"blue {i} {format_distance_mm(d_mm)}",
-            (x, max(16, y - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            BOX_COLOR,
-            2,
-            cv2.LINE_AA,
-        )
-    return out
